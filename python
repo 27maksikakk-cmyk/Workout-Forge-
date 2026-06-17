@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+workout.py - Дневник тренировок на Python (CLI + Tkinter GUI)
+Поддерживает: добавление тренировок, статистику, рекорды, график прогресса.
+"""
+import argparse
+import sys
+import json
+import os
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, asdict, field
+from collections import defaultdict
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, scrolledtext
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+
+DATA_FILE = "workouts.json"
+
+@dataclass
+class Workout:
+    id: int
+    exercise: str
+    sets: int
+    reps: int
+    weight: float
+    date: str          # YYYY-MM-DD
+    notes: str = ""
+
+class WorkoutTracker:
+    def __init__(self, data_file=DATA_FILE):
+        self.data_file = data_file
+        self.workouts: List[Workout] = []
+        self.next_id = 1
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.workouts = [Workout(**w) for w in data]
+                    self.next_id = max([w.id for w in self.workouts], default=0) + 1
+            except:
+                self.workouts = []
+                self.next_id = 1
+        else:
+            self.workouts = []
+            self.next_id = 1
+
+    def save(self):
+        with open(self.data_file, 'w', encoding='utf-8') as f:
+            json.dump([asdict(w) for w in self.workouts], f, indent=2, ensure_ascii=False)
+
+    def add_workout(self, exercise: str, sets: int, reps: int, weight: float, date_str: str = None, notes: str = "") -> Workout:
+        if date_str is None:
+            date_str = date.today().isoformat()
+        w = Workout(self.next_id, exercise, sets, reps, weight, date_str, notes)
+        self.workouts.append(w)
+        self.next_id += 1
+        self.save()
+        return w
+
+    def delete_workout(self, workout_id: int) -> bool:
+        for i, w in enumerate(self.workouts):
+            if w.id == workout_id:
+                del self.workouts[i]
+                self.save()
+                return True
+        return False
+
+    def get_workouts(self, exercise: str = None, date_from: str = None, date_to: str = None,
+                     min_weight: float = None, max_weight: float = None) -> List[Workout]:
+        result = self.workouts
+        if exercise:
+            result = [w for w in result if w.exercise.lower() == exercise.lower()]
+        if date_from:
+            result = [w for w in result if w.date >= date_from]
+        if date_to:
+            result = [w for w in result if w.date <= date_to]
+        if min_weight is not None:
+            result = [w for w in result if w.weight >= min_weight]
+        if max_weight is not None:
+            result = [w for w in result if w.weight <= max_weight]
+        return sorted(result, key=lambda x: x.date)
+
+    def get_statistics(self, exercise: str = None) -> Dict:
+        workouts = self.get_workouts(exercise=exercise)
+        total_workouts = len(workouts)
+        total_volume = sum(w.sets * w.reps * w.weight for w in workouts) if workouts else 0
+        # Лучшие подходы (по объёму = вес * повторения)
+        best_by_exercise = {}
+        for w in workouts:
+            volume = w.sets * w.reps * w.weight
+            key = w.exercise
+            if key not in best_by_exercise or volume > best_by_exercise[key]['volume']:
+                best_by_exercise[key] = {'workout': w, 'volume': volume}
+        # Прогресс по упражнению (средний вес за месяц)
+        progress = {}
+        if exercise:
+            # группируем по месяцам
+            month_avg = defaultdict(float)
+            month_counts = defaultdict(int)
+            for w in workouts:
+                month = w.date[:7]  # YYYY-MM
+                month_avg[month] += w.weight
+                month_counts[month] += 1
+            for m in sorted(month_avg.keys()):
+                progress[m] = month_avg[m] / month_counts[m]
+        return {
+            'total_workouts': total_workouts,
+            'total_volume': total_volume,
+            'best_by_exercise': best_by_exercise,
+            'progress': progress if exercise else {}
+        }
+
+    def get_personal_records(self) -> Dict[str, Workout]:
+        """Лучший подход для каждого упражнения (по весу * повторения)"""
+        best = {}
+        for w in self.workouts:
+            key = w.exercise
+            volume = w.sets * w.reps * w.weight
+            if key not in best or volume > (best[key].sets * best[key].reps * best[key].weight):
+                best[key] = w
+        return best
+
+    def export_csv(self, filepath: str):
+        import csv
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["ID", "Exercise", "Sets", "Reps", "Weight", "Date", "Notes"])
+            for w in self.workouts:
+                writer.writerow([w.id, w.exercise, w.sets, w.reps, w.weight, w.date, w.notes])
+
+# ========== CLI ==========
+def cli():
+    parser = argparse.ArgumentParser(description="Дневник тренировок")
+    subparsers = parser.add_subparsers(dest="command", help="Команды")
+
+    # add
+    add_parser = subparsers.add_parser("add", help="Добавить тренировку")
+    add_parser.add_argument("--exercise", "-e", required=True, help="Название упражнения")
+    add_parser.add_argument("--sets", "-s", type=int, required=True, help="Количество подходов")
+    add_parser.add_argument("--reps", "-r", type=int, required=True, help="Повторений в подходе")
+    add_parser.add_argument("--weight", "-w", type=float, required=True, help="Вес (кг)")
+    add_parser.add_argument("--date", "-d", help="Дата (ГГГГ-ММ-ДД, по умолчанию сегодня)")
+    add_parser.add_argument("--notes", "-n", default="", help="Заметки")
+
+    # list
+    list_parser = subparsers.add_parser("list", help="Показать тренировки")
+    list_parser.add_argument("--exercise", "-e", help="Фильтр по упражнению")
+    list_parser.add_argument("--from", dest="date_from", help="Дата от")
+    list_parser.add_argument("--to", dest="date_to", help="Дата до")
+    list_parser.add_argument("--min-weight", type=float, help="Мин. вес")
+    list_parser.add_argument("--max-weight", type=float, help="Макс. вес")
+
+    # stats
+    stats_parser = subparsers.add_parser("stats", help="Статистика")
+    stats_parser.add_argument("--exercise", "-e", help="Фильтр по упражнению")
+
+    # pr
+    pr_parser = subparsers.add_parser("pr", help="Личные рекорды")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Удалить тренировку")
+    delete_parser.add_argument("--id", type=int, required=True, help="ID записи")
+
+    # export
+    export_parser = subparsers.add_parser("export", help="Экспорт в CSV")
+    export_parser.add_argument("--output", "-o", required=True, help="Имя файла")
+
+    # interactive mode
+    parser.add_argument("--gui", action="store_true", help="Запустить GUI")
+    args = parser.parse_args()
+
+    if args.gui and GUI_AVAILABLE:
+        root = tk.Tk()
+        app = WorkoutTrackerGUI(root)
+        root.mainloop()
+        return
+
+    tracker = WorkoutTracker()
+    if args.command == "add":
+        w = tracker.add_workout(args.exercise, args.sets, args.reps, args.weight, args.date, args.notes)
+        print(f"✅ Тренировка #{w.id} добавлена: {w.exercise} {w.sets}×{w.reps}×{w.weight}кг")
+    elif args.command == "list":
+        workouts = tracker.get_workouts(args.exercise, args.date_from, args.date_to, args.min_weight, args.max_weight)
+        if not workouts:
+            print("Нет записей.")
+        else:
+            print(f"{'ID':<4} {'Упражнение':<15} {'Подходы':<8} {'Повт.':<6} {'Вес':<6} {'Дата':<12} {'Заметки'}")
+            for w in workouts:
+                print(f"{w.id:<4} {w.exercise:<15} {w.sets:<8} {w.reps:<6} {w.weight:<6.1f} {w.date:<12} {w.notes}")
+    elif args.command == "stats":
+        stats = tracker.get_statistics(args.exercise)
+        print(f"📊 Статистика {'по упражнению ' + args.exercise if args.exercise else ''}")
+        print(f"Всего тренировок: {stats['total_workouts']}")
+        print(f"Общий объём (кг×повт.): {stats['total_volume']:.1f}")
+        if stats['best_by_exercise']:
+            print("Лучшие подходы по объёму:")
+            for ex, data in stats['best_by_exercise'].items():
+                w = data['workout']
+                print(f"  {ex}: {w.sets}×{w.reps}×{w.weight}кг = {data['volume']} (id {w.id})")
+        if stats['progress']:
+            print("Прогресс среднего веса по месяцам:")
+            for month, avg in stats['progress'].items():
+                print(f"  {month}: {avg:.1f} кг")
+    elif args.command == "pr":
+        records = tracker.get_personal_records()
+        if not records:
+            print("Нет рекордов.")
+        else:
+            print("🏆 Личные рекорды (максимальный объём):")
+            for ex, w in records.items():
+                print(f"{ex}: {w.sets}×{w.reps}×{w.weight}кг = {w.sets*w.reps*w.weight} (id {w.id})")
+    elif args.command == "delete":
+        if tracker.delete_workout(args.id):
+            print(f"✅ Тренировка #{args.id} удалена")
+        else:
+            print(f"❌ Тренировка #{args.id} не найдена")
+    elif args.command == "export":
+        tracker.export_csv(args.output)
+        print(f"Экспортировано в {args.output}")
+    else:
+        interactive_mode(tracker)
+
+def interactive_mode(tracker):
+    while True:
+        print("\n🏋️ Дневник тренировок (интерактивный)")
+        print("1. Добавить тренировку")
+        print("2. Список тренировок (с фильтром)")
+        print("3. Статистика")
+        print("4. Личные рекорды")
+        print("5. Удалить")
+        print("6. Экспорт CSV")
+        print("0. Выход")
+        choice = input("Выберите действие: ").strip()
+        if choice == "0":
+            break
+        elif choice == "1":
+            exercise = input("Упражнение: ").strip()
+            if not exercise:
+                print("Упражнение обязательно")
+                continue
+            try:
+                sets = int(input("Подходы: ").strip())
+                reps = int(input("Повторений: ").strip())
+                weight = float(input("Вес (кг): ").strip())
+            except ValueError:
+                print("Неверные числовые данные")
+                continue
+            date_str = input("Дата (ГГГГ-ММ-ДД, Enter сегодня): ").strip()
+            if not date_str:
+                date_str = date.today().isoformat()
+            notes = input("Заметки: ").strip()
+            w = tracker.add_workout(exercise, sets, reps, weight, date_str, notes)
+            print(f"✅ Добавлена тренировка #{w.id}")
+        elif choice == "2":
+            exercise = input("Упражнение (Enter пропустить): ").strip() or None
+            date_from = input("Дата от (Enter пропустить): ").strip() or None
+            date_to = input("Дата до (Enter пропустить): ").strip() or None
+            min_w = input("Мин. вес (Enter пропустить): ").strip()
+            max_w = input("Макс. вес (Enter пропустить): ").strip()
+            min_w = float(min_w) if min_w else None
+            max_w = float(max_w) if max_w else None
+            workouts = tracker.get_workouts(exercise, date_from, date_to, min_w, max_w)
+            if not workouts:
+                print("Нет записей.")
+            else:
+                print(f"{'ID':<4} {'Упражнение':<15} {'Подходы':<8} {'Повт.':<6} {'Вес':<6} {'Дата':<12} {'Заметки'}")
+                for w in workouts:
+                    print(f"{w.id:<4} {w.exercise:<15} {w.sets:<8} {w.reps:<6} {w.weight:<6.1f} {w.date:<12} {w.notes}")
+        elif choice == "3":
+            exercise = input("Упражнение (Enter все): ").strip() or None
+            stats = tracker.get_statistics(exercise)
+            print(f"📊 Статистика {'по упражнению ' + exercise if exercise else ''}")
+            print(f"Всего тренировок: {stats['total_workouts']}")
+            print(f"Общий объём: {stats['total_volume']:.1f}")
+            if stats['best_by_exercise']:
+                print("Лучшие подходы по объёму:")
+                for ex, data in stats['best_by_exercise'].items():
+                    w = data['workout']
+                    print(f"  {ex}: {w.sets}×{w.reps}×{w.weight}кг = {data['volume']} (id {w.id})")
+            if stats['progress']:
+                print("Прогресс среднего веса по месяцам:")
+                for month, avg in stats['progress'].items():
+                    print(f"  {month}: {avg:.1f} кг")
+        elif choice == "4":
+            records = tracker.get_personal_records()
+            if not records:
+                print("Нет рекордов.")
+            else:
+                print("🏆 Личные рекорды (максимальный объём):")
+                for ex, w in records.items():
+                    print(f"{ex}: {w.sets}×{w.reps}×{w.weight}кг = {w.sets*w.reps*w.weight} (id {w.id})")
+        elif choice == "5":
+            try:
+                wid = int(input("ID для удаления: ").strip())
+            except ValueError:
+                print("Неверный ID")
+                continue
+            if tracker.delete_workout(wid):
+                print("✅ Удалено")
+            else:
+                print("❌ Не найдено")
+        elif choice == "6":
+            fname = input("Имя файла (CSV): ").strip()
+            if not fname:
+                fname = "workouts.csv"
+            tracker.export_csv(fname)
+            print(f"Экспортировано в {fname}")
+        else:
+            print("Неверный выбор")
+
+# ========== GUI ==========
+if GUI_AVAILABLE:
+    class WorkoutTrackerGUI:
+        def __init__(self, root):
+            self.root = root
+            self.root.title("🏋️ Дневник тренировок")
+            self.root.geometry("800x600")
+            self.root.resizable(True, True)
+            self.tracker = WorkoutTracker()
+            self.create_widgets()
+            self.refresh_list()
+
+        def create_widgets(self):
+            main = ttk.Frame(self.root, padding="10")
+            main.pack(fill=tk.BOTH, expand=True)
+
+            # Добавление
+            add_frame = ttk.LabelFrame(main, text="Добавить тренировку")
+            add_frame.pack(fill=tk.X, pady=5)
+            grid = ttk.Frame(add_frame)
+            grid.pack(pady=5, padx=5)
+            ttk.Label(grid, text="Упражнение:").grid(row=0, column=0, sticky="w")
+            self.ex_entry = ttk.Entry(grid, width=15)
+            self.ex_entry.grid(row=0, column=1, padx=5)
+            ttk.Label(grid, text="Подходы:").grid(row=0, column=2, sticky="w")
+            self.sets_entry = ttk.Entry(grid, width=5)
+            self.sets_entry.grid(row=0, column=3, padx=5)
+            ttk.Label(grid, text="Повт.:").grid(row=0, column=4, sticky="w")
+            self.reps_entry = ttk.Entry(grid, width=5)
+            self.reps_entry.grid(row=0, column=5, padx=5)
+            ttk.Label(grid, text="Вес (кг):").grid(row=0, column=6, sticky="w")
+            self.weight_entry = ttk.Entry(grid, width=8)
+            self.weight_entry.grid(row=0, column=7, padx=5)
+            ttk.Label(grid, text="Дата:").grid(row=0, column=8, sticky="w")
+            self.date_entry = ttk.Entry(grid, width=10)
+            self.date_entry.insert(0, date.today().isoformat())
+            self.date_entry.grid(row=0, column=9, padx=5)
+            ttk.Label(grid, text="Заметки:").grid(row=0, column=10, sticky="w")
+            self.notes_entry = ttk.Entry(grid, width=15)
+            self.notes_entry.grid(row=0, column=11, padx=5)
+            ttk.Button(grid, text="➕ Добавить", command=self.add_workout).grid(row=0, column=12, padx=5)
+
+            # Таблица
+            self.tree = ttk.Treeview(main, columns=("id", "exercise", "sets", "reps", "weight", "date", "notes"), show="headings")
+            self.tree.heading("id", text="ID")
+            self.tree.heading("exercise", text="Упражнение")
+            self.tree.heading("sets", text="Подходы")
+            self.tree.heading("reps", text="Повт.")
+            self.tree.heading("weight", text="Вес")
+            self.tree.heading("date", text="Дата")
+            self.tree.heading("notes", text="Заметки")
+            self.tree.column("id", width=40)
+            self.tree.column("exercise", width=120)
+            self.tree.column("sets", width=60)
+            self.tree.column("reps", width=60)
+            self.tree.column("weight", width=70)
+            self.tree.column("date", width=100)
+            self.tree.column("notes", width=150)
+            scroll = ttk.Scrollbar(main, orient=tk.VERTICAL, command=self.tree.yview)
+            self.tree.configure(yscrollcommand=scroll.set)
+            self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            # Кнопки
+            bottom = ttk.Frame(main)
+            bottom.pack(fill=tk.X, pady=5)
+            ttk.Button(bottom, text="📊 Статистика", command=self.show_stats).pack(side=tk.LEFT, padx=5)
+            ttk.Button(bottom, text="🏆 Рекорды", command=self.show_pr).pack(side=tk.LEFT, padx=5)
+            ttk.Button(bottom, text="🗑 Удалить", command=self.delete_workout).pack(side=tk.LEFT, padx=5)
+            ttk.Button(bottom, text="💾 Экспорт CSV", command=self.export_csv).pack(side=tk.LEFT, padx=5)
+
+        def refresh_list(self, workouts=None):
+            self.tree.delete(*self.tree.get_children())
+            if workouts is None:
+                workouts = self.tracker.get_workouts()
+            for w in workouts:
+                self.tree.insert("", tk.END, values=(w.id, w.exercise, w.sets, w.reps, w.weight, w.date, w.notes))
+
+        def add_workout(self):
+            exercise = self.ex_entry.get().strip()
+            if not exercise:
+                messagebox.showerror("Ошибка", "Введите упражнение")
+                return
+            try:
+                sets = int(self.sets_entry.get().strip())
+                reps = int(self.reps_entry.get().strip())
+                weight = float(self.weight_entry.get().strip())
+            except ValueError:
+                messagebox.showerror("Ошибка", "Неверные числа")
+                return
+            date_str = self.date_entry.get().strip() or date.today().isoformat()
+            notes = self.notes_entry.get().strip()
+            self.tracker.add_workout(exercise, sets, reps, weight, date_str, notes)
+            self.ex_entry.delete(0, tk.END)
+            self.sets_entry.delete(0, tk.END)
+            self.reps_entry.delete(0, tk.END)
+            self.weight_entry.delete(0, tk.END)
+            self.notes_entry.delete(0, tk.END)
+            self.refresh_list()
+
+        def get_selected_id(self):
+            selected = self.tree.selection()
+            if not selected:
+                messagebox.showwarning("Выберите запись")
+                return None
+            return int(self.tree.item(selected[0])['values'][0])
+
+        def delete_workout(self):
+            wid = self.get_selected_id()
+            if wid is not None:
+                if messagebox.askyesno("Удаление", f"Удалить тренировку #{wid}?"):
+                    if self.tracker.delete_workout(wid):
+                        self.refresh_list()
+
+        def show_stats(self):
+            exercise = None
+            # можно сделать диалог выбора упражнения, упрощённо
+            stats = self.tracker.get_statistics(exercise)
+            msg = f"📊 Статистика\n\n"
+            msg += f"Всего тренировок: {stats['total_workouts']}\n"
+            msg += f"Общий объём: {stats['total_volume']:.1f}\n"
+            if stats['best_by_exercise']:
+                msg += "\nЛучшие подходы по объёму:\n"
+                for ex, data in stats['best_by_exercise'].items():
+                    w = data['workout']
+                    msg += f"  {ex}: {w.sets}×{w.reps}×{w.weight}кг = {data['volume']} (id {w.id})\n"
+            if stats['progress']:
+                msg += "\nПрогресс среднего веса по месяцам:\n"
+                for month, avg in stats['progress'].items():
+                    msg += f"  {month}: {avg:.1f} кг\n"
+            messagebox.showinfo("Статистика", msg)
+
+        def show_pr(self):
+            records = self.tracker.get_personal_records()
+            if not records:
+                messagebox.showinfo("Рекорды", "Нет рекордов.")
+                return
+            msg = "🏆 Личные рекорды (максимальный объём):\n\n"
+            for ex, w in records.items():
+                msg += f"{ex}: {w.sets}×{w.reps}×{w.weight}кг = {w.sets*w.reps*w.weight} (id {w.id})\n"
+            messagebox.showinfo("Рекорды", msg)
+
+        def export_csv(self):
+            filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+            if filepath:
+                self.tracker.export_csv(filepath)
+                messagebox.showinfo("Экспорт", f"Сохранено в {filepath}")
+
+if __name__ == "__main__":
+    cli()
